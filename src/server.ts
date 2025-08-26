@@ -3,10 +3,14 @@ import { WebSocketServer } from 'ws';
 import http from 'http';
 import dotenv from 'dotenv';
 import twilio from 'twilio';
+import OpenAI from 'openai';
 
 dotenv.config();
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 const app = express();
 app.use(express.json());
@@ -22,14 +26,15 @@ app.post('/incoming-call', (req, res) => {
   const response = new VoiceResponse();
   const connect = response.connect();
   const conversationRelay = connect.conversationRelay({
-    url: `wss://${req.headers.host}`
+    url: `wss://${req.headers.host}`,
+    debug: 'debugging speaker-events tokens-played'  // Enable debug logging
   });
   
-  // Add language configurations
+  // Add language configuration with a valid Google voice
   conversationRelay.language({
     code: 'en-US',
     ttsProvider: 'google',
-    voice: 'en-US-Journey-O'
+    voice: 'en-US-Standard-C'  // Using a standard Google voice
   });
   
   res.type('text/xml');
@@ -39,16 +44,41 @@ app.post('/incoming-call', (req, res) => {
 // Conversation Relay WebSocket handler
 wss.on('connection', (ws) => {
   console.log('Twilio ConversationRelay connected');
-  let callSid = null;
+  let callSid: string | null = null;
 
   // Helper function to send text response to Twilio for TTS
-  const sendText = (text: string) => {
-    const message = {
+  const sendText = (text: string, lang = 'en-US') => {
+    if (!text) return;
+    // You can stream tokens for lower latency; here we send the whole line.
+    const payload = {
       type: 'text',
-      text: text
+      token: text,         // ✅ required - using 'token' not 'text'
+      last: true,          // ✅ mark this as the last token in this "talk turn"
+      lang,                // optional; otherwise TwiML default is used
+      interruptible: true, // optional
+      preemptible: true    // optional
     };
     console.log('Sending to Twilio for TTS:', text);
-    ws.send(JSON.stringify(message));
+    ws.send(JSON.stringify(payload));
+  };
+  
+  // Helper function to get AI response
+  const getAIResponse = async (userMessage: string): Promise<string> => {
+    try {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "You are a helpful voice assistant. Keep responses concise and conversational." },
+          { role: "user", content: userMessage }
+        ],
+        temperature: 0.7,
+        max_tokens: 150
+      });
+      return completion.choices[0]?.message?.content || "I'm sorry, I didn't understand that.";
+    } catch (error) {
+      console.error('OpenAI error:', error);
+      return "I'm having trouble processing that request. Please try again.";
+    }
   };
 
   ws.on('message', async (data) => {
@@ -74,9 +104,10 @@ wss.on('connection', (ws) => {
           console.log('User said:', userMessage);
           console.log('Language:', msg.lang);
           
-          // Echo back what the user said (replace with your AI logic)
-          const response = `I heard you say: ${userMessage}. How else can I help?`;
-          sendText(response);
+          // Get AI response from OpenAI
+          const aiResponse = await getAIResponse(userMessage);
+          console.log('AI response:', aiResponse);
+          sendText(aiResponse);
         }
         break;
 
@@ -96,7 +127,7 @@ wss.on('connection', (ws) => {
 
       case 'error':
         // Error from Twilio
-        console.error('Error from Twilio:', msg.description);
+        console.error('Error from Twilio:', msg.description || msg.message || msg);
         break;
 
       case 'stop':
@@ -106,7 +137,10 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => console.log('Twilio ConversationRelay disconnected'));
+  ws.on('close', (code, reason) => {
+    console.log('Twilio ConversationRelay disconnected',
+                code, reason?.toString?.() || '');
+  });
   ws.on('error', (error) => console.error('WebSocket error:', error));
 });
 
