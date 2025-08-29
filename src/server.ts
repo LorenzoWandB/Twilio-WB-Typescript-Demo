@@ -4,6 +4,7 @@ import http from 'http';
 import dotenv from 'dotenv';
 import twilio from 'twilio';
 import OpenAI from 'openai';
+import * as weave from 'weave';
 
 dotenv.config();
 
@@ -11,6 +12,12 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
+
+// Initialize Weave for tracing
+let weaveClient: any;
+(async () => {
+  weaveClient = await weave.init('Lorenzo-Team/Twilio-Voice-Assistant');
+})();
 
 const app = express();
 app.use(express.json());
@@ -47,7 +54,7 @@ wss.on('connection', (ws) => {
   let callSid: string | null = null;
 
   // Helper function to send text response to Twilio for TTS
-  const sendText = (text: string, lang = 'en-US') => {
+  const sendText = weave.op(function sendTextToTTS(text: string, lang = 'en-US') {
     if (!text) return;
     // You can stream tokens for lower latency; here we send the whole line.
     const payload = {
@@ -60,10 +67,10 @@ wss.on('connection', (ws) => {
     };
     console.log('Sending to Twilio for TTS:', text);
     ws.send(JSON.stringify(payload));
-  };
+  });
   
   // Helper function to get AI response
-  const getAIResponse = async (userMessage: string): Promise<string> => {
+  const getAIResponse = weave.op(async function getAIResponse(userMessage: string): Promise<string> {
     try {
       const completion = await openai.chat.completions.create({
         model: "gpt-3.5-turbo",
@@ -79,50 +86,93 @@ wss.on('connection', (ws) => {
       console.error('OpenAI error:', error);
       return "I'm having trouble processing that request. Please try again.";
     }
-  };
+  });
 
-  ws.on('message', async (data) => {
+  // Main message handler
+  const handleMessage = async (data: any) => {
     const msg = JSON.parse(data.toString());
     console.log('Received:', msg.type, msg);
     
     switch (msg.type) {
       case 'setup':
         // Initial setup from Twilio - this is when the call connects
-        callSid = msg.callSid;
-        console.log('Call SID:', callSid);
-        console.log('From:', msg.from);
-        console.log('To:', msg.to);
-        
-        // Send initial greeting after setup
-        sendText('Hello! Welcome to the voice assistant. How can I help you today?');
+        const handleSetup = weave.op(function handleCallSetup(setupMsg: any) {
+          callSid = setupMsg.callSid;
+          console.log('Call SID:', callSid);
+          console.log('From:', setupMsg.from);
+          console.log('To:', setupMsg.to);
+          
+          // Send initial greeting after setup
+          sendText('Hello! Welcome to the voice assistant. How can I help you today?');
+          
+          return {
+            callSid: setupMsg.callSid,
+            from: setupMsg.from,
+            to: setupMsg.to,
+            timestamp: new Date().toISOString()
+          };
+        });
+        handleSetup(msg);
         break;
 
       case 'prompt':
         // User spoke something - msg.voicePrompt contains the transcribed text
-        if (msg.voicePrompt) {
-          const userMessage = msg.voicePrompt;
-          console.log('User said:', userMessage);
-          console.log('Language:', msg.lang);
-          
-          // Get AI response from OpenAI
-          const aiResponse = await getAIResponse(userMessage);
-          console.log('AI response:', aiResponse);
-          sendText(aiResponse);
-        }
+        const handlePrompt = weave.op(async function handleConversationTurn(promptMsg: any) {
+          if (promptMsg.voicePrompt) {
+            const userMessage = promptMsg.voicePrompt;
+            console.log('User said:', userMessage);
+            console.log('Language:', promptMsg.lang);
+            
+            const startTime = Date.now();
+            
+            // Get AI response from OpenAI
+            const aiResponse = await getAIResponse(userMessage);
+            console.log('AI response:', aiResponse);
+            
+            const processingTime = Date.now() - startTime;
+            
+            sendText(aiResponse);
+            
+            return {
+              userMessage,
+              aiResponse,
+              language: promptMsg.lang,
+              processingTimeMs: processingTime,
+              timestamp: new Date().toISOString()
+            };
+          }
+        });
+        await handlePrompt(msg);
         break;
 
       case 'interrupt':
         // User interrupted the assistant while it was speaking
-        console.log('User interrupted');
-        console.log('Utterance until interrupt:', msg.utteranceUntilInterrupt);
-        console.log('Duration until interrupt (ms):', msg.durationUntilInterruptMs);
-        // Handle interruption - stop any ongoing processing
+        const handleInterrupt = weave.op(function handleUserInterruption(interruptMsg: any) {
+          console.log('User interrupted');
+          console.log('Utterance until interrupt:', interruptMsg.utteranceUntilInterrupt);
+          console.log('Duration until interrupt (ms):', interruptMsg.durationUntilInterruptMs);
+          
+          return {
+            utteranceUntilInterrupt: interruptMsg.utteranceUntilInterrupt,
+            durationUntilInterruptMs: interruptMsg.durationUntilInterruptMs,
+            timestamp: new Date().toISOString()
+          };
+        });
+        handleInterrupt(msg);
         break;
 
       case 'dtmf':
         // User pressed a phone key
-        console.log('DTMF digit received:', msg.digit);
-        sendText(`You pressed ${msg.digit}`);
+        const handleDTMF = weave.op(function handleDTMFInput(dtmfMsg: any) {
+          console.log('DTMF digit received:', dtmfMsg.digit);
+          sendText(`You pressed ${dtmfMsg.digit}`);
+          
+          return {
+            digit: dtmfMsg.digit,
+            timestamp: new Date().toISOString()
+          };
+        });
+        handleDTMF(msg);
         break;
 
       case 'error':
@@ -132,10 +182,21 @@ wss.on('connection', (ws) => {
 
       case 'stop':
         // Call ended
-        console.log('Call ended');
+        const handleStop = weave.op(function handleCallEnd(stopMsg: any) {
+          console.log('Call ended');
+          
+          return {
+            callSid,
+            reason: stopMsg.reason || 'normal',
+            timestamp: new Date().toISOString()
+          };
+        });
+        handleStop(msg);
         break;
     }
-  });
+  };
+  
+  ws.on('message', handleMessage);
 
   ws.on('close', (code, reason) => {
     console.log('Twilio ConversationRelay disconnected',
